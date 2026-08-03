@@ -4,7 +4,7 @@
 // --------------------------------------------------------------
 // Uncomment to force reset to default keys & clear SOCD on next boot
 // --------------------------------------------------------------
-#define FORCE_RESET_ON_BOOT
+// #define FORCE_RESET_ON_BOOT // comment this when u dont want to force reset anymore
 
 // Pin layout
 const int pins[] = {7, 4, 6, 2, 5, 3};
