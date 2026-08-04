@@ -2,7 +2,8 @@
 #include <EEPROM.h>
 
 // --------------------------------------------------------------
-// Uncomment to force reset on next boot (then comment out again)
+// Uncomment ONLY if you want to force reset on NEXT boot
+// (then comment it out again after upload)
 // --------------------------------------------------------------
 // #define FORCE_RESET_ON_BOOT
 
@@ -10,27 +11,28 @@
 const int pins[] = {7, 4, 6, 2, 5, 3};
 const int NUM_KEYS = 6;
 
-// ---------- New EEPROM layout ----------
+// EEPROM layout
 const int MAGIC_ADDR = 0;
-const int SENTENCE_ADDR = 1;                               // 6 * 48 = 288 bytes
-const int ENTER_FLAG_ADDR = SENTENCE_ADDR + NUM_KEYS * 48; // 6 bytes
-const int SOCD_COUNT_ADDR = ENTER_FLAG_ADDR + NUM_KEYS;
-const int SOCD_DATA_ADDR = SOCD_COUNT_ADDR + 1;
-const byte MAGIC_VALUE = 0xCC; // new magic
+const int PRESS_NAMES_ADDR = 1;                                  // 6 * 16 = 96
+const int RELEASE_NAMES_ADDR = PRESS_NAMES_ADDR + NUM_KEYS * 16; // 96
+const int MODE_ADDR = RELEASE_NAMES_ADDR + NUM_KEYS * 16;        // 6 bytes
+const int SOCD_COUNT_ADDR = MODE_ADDR + NUM_KEYS;                // 1 byte
+const int SOCD_DATA_ADDR = SOCD_COUNT_ADDR + 1;                  // 2 * MAX_PAIRS
+const byte MAGIC_VALUE = 0xDD;                                   // NEW magic – forces reset if old EEPROM data exists
 
-// Sentence limits
-const int MAX_SENTENCE_LEN = 47; // 47 chars + null terminator
 const int MAX_SOCD_PAIRS = 2;
 
-// Default sentences (single characters for backward compatibility)
-const char defaultSentences[NUM_KEYS][MAX_SENTENCE_LEN + 1] = {"q", "w", "e", "a", "s", "d"};
-bool defaultEnterAfter[NUM_KEYS] = {false, false, false, false, false, false};
+// Defaults: all keys, no release keys, all Key mode
+const char defaultPressKeys[NUM_KEYS][16] = {"q", "w", "e", "a", "s", "d"};
+const char defaultReleaseKeys[NUM_KEYS][16] = {"", "", "", "", "", ""};
+const uint8_t defaultMode[NUM_KEYS] = {0, 0, 0, 0, 0, 0};
 
 // Runtime data
-char sentences[NUM_KEYS][MAX_SENTENCE_LEN + 1];
-bool enterAfter[NUM_KEYS];
+char pressKeys[NUM_KEYS][16];
+char releaseKeys[NUM_KEYS][16];
+uint8_t mode[NUM_KEYS]; // 0=Key, 1=Dual
 
-// SOCD storage
+// SOCD
 int socdPairs[MAX_SOCD_PAIRS][2];
 int socdCount = 0;
 
@@ -38,12 +40,11 @@ int socdCount = 0;
 unsigned long lastDebounceTime[NUM_KEYS] = {0};
 int lastState[NUM_KEYS] = {HIGH};
 int currentState[NUM_KEYS] = {HIGH};
-bool wasPressed[NUM_KEYS] = {false}; // for falling edge detection
 unsigned long pressTime[NUM_KEYS] = {0};
-bool activeState[NUM_KEYS] = {false}; // only used for single‑char keys
+bool activeState[NUM_KEYS] = {false};
 const unsigned long debounceDelay = 5;
 
-// ---------- parseKey (moved to the top) ----------
+// ----- parseKey (supports F13-F18) -----
 int parseKey(String s)
 {
   if (s.length() == 1)
@@ -114,24 +115,21 @@ int parseKey(String s)
     int num = s.substring(1).toInt();
     if (num >= 1 && num <= 12)
       return KEY_F1 + num - 1;
+    if (num >= 13 && num <= 18)
+      return KEY_F13 + (num - 13);
   }
   return ' ';
 }
 
-// ----- Helper: check if a button has a single‑character sentence -----
-bool isSingleChar(int idx)
-{
-  return (strlen(sentences[idx]) == 1);
-}
+bool isValidPressKey(int idx) { return (parseKey(String(pressKeys[idx])) != ' '); }
+bool isValidReleaseKey(int idx) { return (parseKey(String(releaseKeys[idx])) != ' '); }
 
-// ----- Helper: remove a button from all SOCD pairs -----
 void removeButtonFromSOCD(int idx)
 {
   for (int p = socdCount - 1; p >= 0; p--)
   {
     if (socdPairs[p][0] == idx || socdPairs[p][1] == idx)
     {
-      // shift remaining pairs down
       for (int q = p; q < socdCount - 1; q++)
       {
         socdPairs[q][0] = socdPairs[q + 1][0];
@@ -142,10 +140,9 @@ void removeButtonFromSOCD(int idx)
       socdPairs[socdCount][1] = -1;
     }
   }
-  // Ensure activeState for this button is cleared
   if (activeState[idx])
   {
-    int key = parseKey(String(sentences[idx]));
+    int key = parseKey(String(pressKeys[idx]));
     Keyboard.release(key);
     activeState[idx] = false;
   }
@@ -156,14 +153,21 @@ void saveToEEPROM()
 {
   for (int i = 0; i < NUM_KEYS; i++)
   {
-    int addr = SENTENCE_ADDR + i * MAX_SENTENCE_LEN;
-    for (int j = 0; j < MAX_SENTENCE_LEN; j++)
+    int addr = PRESS_NAMES_ADDR + i * 16;
+    for (int j = 0; j < 16; j++)
     {
-      EEPROM.write(addr + j, sentences[i][j]);
-      if (sentences[i][j] == '\0')
+      EEPROM.write(addr + j, pressKeys[i][j]);
+      if (pressKeys[i][j] == '\0')
         break;
     }
-    EEPROM.write(ENTER_FLAG_ADDR + i, enterAfter[i] ? 1 : 0);
+    addr = RELEASE_NAMES_ADDR + i * 16;
+    for (int j = 0; j < 16; j++)
+    {
+      EEPROM.write(addr + j, releaseKeys[i][j]);
+      if (releaseKeys[i][j] == '\0')
+        break;
+    }
+    EEPROM.write(MODE_ADDR + i, mode[i]);
   }
   EEPROM.write(SOCD_COUNT_ADDR, socdCount);
   int addr = SOCD_DATA_ADDR;
@@ -180,9 +184,9 @@ void loadFromEEPROM()
 #ifdef FORCE_RESET_ON_BOOT
   for (int i = 0; i < NUM_KEYS; i++)
   {
-    strncpy(sentences[i], defaultSentences[i], MAX_SENTENCE_LEN);
-    sentences[i][MAX_SENTENCE_LEN] = '\0';
-    enterAfter[i] = defaultEnterAfter[i];
+    strcpy(pressKeys[i], defaultPressKeys[i]);
+    strcpy(releaseKeys[i], defaultReleaseKeys[i]);
+    mode[i] = defaultMode[i];
   }
   socdCount = 0;
   for (int p = 0; p < MAX_SOCD_PAIRS; p++)
@@ -193,20 +197,29 @@ void loadFromEEPROM()
   saveToEEPROM();
   return;
 #endif
-
   if (EEPROM.read(MAGIC_ADDR) == MAGIC_VALUE)
   {
     for (int i = 0; i < NUM_KEYS; i++)
     {
-      int addr = SENTENCE_ADDR + i * MAX_SENTENCE_LEN;
-      for (int j = 0; j < MAX_SENTENCE_LEN; j++)
+      int addr = PRESS_NAMES_ADDR + i * 16;
+      for (int j = 0; j < 15; j++)
       {
-        sentences[i][j] = EEPROM.read(addr + j);
-        if (sentences[i][j] == '\0')
+        pressKeys[i][j] = EEPROM.read(addr + j);
+        if (pressKeys[i][j] == '\0')
           break;
       }
-      sentences[i][MAX_SENTENCE_LEN] = '\0';
-      enterAfter[i] = EEPROM.read(ENTER_FLAG_ADDR + i) == 1;
+      pressKeys[i][15] = '\0';
+      addr = RELEASE_NAMES_ADDR + i * 16;
+      for (int j = 0; j < 15; j++)
+      {
+        releaseKeys[i][j] = EEPROM.read(addr + j);
+        if (releaseKeys[i][j] == '\0')
+          break;
+      }
+      releaseKeys[i][15] = '\0';
+      mode[i] = EEPROM.read(MODE_ADDR + i);
+      if (mode[i] > 1)
+        mode[i] = 0;
     }
     socdCount = EEPROM.read(SOCD_COUNT_ADDR);
     if (socdCount > MAX_SOCD_PAIRS)
@@ -217,7 +230,7 @@ void loadFromEEPROM()
       int a = EEPROM.read(addr + p * 2) - 1;
       int b = EEPROM.read(addr + p * 2 + 1) - 1;
       if (p < socdCount && a >= 0 && a < NUM_KEYS && b >= 0 && b < NUM_KEYS && a != b &&
-          isSingleChar(a) && isSingleChar(b))
+          isValidPressKey(a) && isValidPressKey(b) && mode[a] == 0 && mode[b] == 0)
       {
         socdPairs[p][0] = a;
         socdPairs[p][1] = b;
@@ -228,12 +241,12 @@ void loadFromEEPROM()
         socdPairs[p][1] = -1;
       }
     }
-    // Ensure SOCD only contains single‑char buttons
+    // clean invalid SOCD pairs
     for (int p = 0; p < socdCount; p++)
     {
-      if (!isSingleChar(socdPairs[p][0]) || !isSingleChar(socdPairs[p][1]))
+      if (!isValidPressKey(socdPairs[p][0]) || !isValidPressKey(socdPairs[p][1]) ||
+          mode[socdPairs[p][0]] != 0 || mode[socdPairs[p][1]] != 0)
       {
-        // remove this pair
         for (int q = p; q < socdCount - 1; q++)
         {
           socdPairs[q][0] = socdPairs[q + 1][0];
@@ -242,18 +255,18 @@ void loadFromEEPROM()
         socdCount--;
         socdPairs[socdCount][0] = -1;
         socdPairs[socdCount][1] = -1;
-        p--; // recheck same index
+        p--;
       }
     }
   }
   else
   {
-    // Defaults
+    // First boot or old EEPROM – write defaults
     for (int i = 0; i < NUM_KEYS; i++)
     {
-      strncpy(sentences[i], defaultSentences[i], MAX_SENTENCE_LEN);
-      sentences[i][MAX_SENTENCE_LEN] = '\0';
-      enterAfter[i] = defaultEnterAfter[i];
+      strcpy(pressKeys[i], defaultPressKeys[i]);
+      strcpy(releaseKeys[i], defaultReleaseKeys[i]);
+      mode[i] = defaultMode[i];
     }
     socdCount = 0;
     for (int p = 0; p < MAX_SOCD_PAIRS; p++)
@@ -269,9 +282,9 @@ void resetToDefaults()
 {
   for (int i = 0; i < NUM_KEYS; i++)
   {
-    strncpy(sentences[i], defaultSentences[i], MAX_SENTENCE_LEN);
-    sentences[i][MAX_SENTENCE_LEN] = '\0';
-    enterAfter[i] = defaultEnterAfter[i];
+    strcpy(pressKeys[i], defaultPressKeys[i]);
+    strcpy(releaseKeys[i], defaultReleaseKeys[i]);
+    mode[i] = defaultMode[i];
   }
   socdCount = 0;
   for (int p = 0; p < MAX_SOCD_PAIRS; p++)
@@ -282,35 +295,9 @@ void resetToDefaults()
   saveToEEPROM();
 }
 
-// ----- Send sentence (typed once) -----
-void sendSentence(int idx)
-{
-  String s = String(sentences[idx]);
-  if (s.length() == 0)
-    return;
-  // Type each character
-  for (size_t i = 0; i < s.length(); i++)
-  {
-    char c = s.charAt(i);
-    int key = parseKey(String(c)); // parseKey handles single characters
-    Keyboard.press(key);
-    delay(10);
-    Keyboard.release(key);
-    delay(5);
-  }
-  // If Enter after, press Enter
-  if (enterAfter[idx])
-  {
-    Keyboard.press(KEY_RETURN);
-    delay(10);
-    Keyboard.release(KEY_RETURN);
-  }
-}
-
-// ----- SOCD update (only for single‑char buttons) -----
+// ----- Update Keys (for Key mode and SOCD) -----
 void updateKeys()
 {
-  // Determine which buttons are in any SOCD pair
   bool isInAnyPair[NUM_KEYS] = {false};
   for (int p = 0; p < socdCount; p++)
   {
@@ -322,37 +309,33 @@ void updateKeys()
       isInAnyPair[b] = true;
   }
 
-  // For single‑char buttons NOT in SOCD, handle as normal key (press/hold)
   for (int i = 0; i < NUM_KEYS; i++)
   {
-    if (!isSingleChar(i) || isInAnyPair[i])
+    if (mode[i] != 0 || isInAnyPair[i])
       continue;
     bool shouldBeActive = (currentState[i] == LOW);
     if (shouldBeActive && !activeState[i])
     {
-      int key = parseKey(String(sentences[i]));
+      int key = parseKey(String(pressKeys[i]));
       Keyboard.press(key);
       activeState[i] = true;
     }
     else if (!shouldBeActive && activeState[i])
     {
-      int key = parseKey(String(sentences[i]));
+      int key = parseKey(String(pressKeys[i]));
       Keyboard.release(key);
       activeState[i] = false;
     }
   }
 
-  // Handle SOCD pairs (only for single‑char buttons)
   for (int p = 0; p < socdCount; p++)
   {
     int i1 = socdPairs[p][0];
     int i2 = socdPairs[p][1];
     if (i1 == -1 || i2 == -1)
       continue;
-    // Ensure they are still single‑char
-    if (!isSingleChar(i1) || !isSingleChar(i2))
+    if (mode[i1] != 0 || mode[i2] != 0)
     {
-      // remove this pair (should not happen, but safety)
       for (int q = p; q < socdCount - 1; q++)
       {
         socdPairs[q][0] = socdPairs[q + 1][0];
@@ -364,10 +347,8 @@ void updateKeys()
       p--;
       continue;
     }
-
     bool pressed1 = (currentState[i1] == LOW);
     bool pressed2 = (currentState[i2] == LOW);
-
     int activeIdx = -1;
     if (pressed1 && pressed2)
     {
@@ -384,14 +365,9 @@ void updateKeys()
       }
     }
     else if (pressed1)
-    {
       activeIdx = i1;
-    }
     else if (pressed2)
-    {
       activeIdx = i2;
-    }
-
     int pairIndices[2] = {i1, i2};
     for (int idx = 0; idx < 2; idx++)
     {
@@ -399,13 +375,13 @@ void updateKeys()
       bool shouldBeActive = (i == activeIdx);
       if (shouldBeActive && !activeState[i])
       {
-        int key = parseKey(String(sentences[i]));
+        int key = parseKey(String(pressKeys[i]));
         Keyboard.press(key);
         activeState[i] = true;
       }
       else if (!shouldBeActive && activeState[i])
       {
-        int key = parseKey(String(sentences[i]));
+        int key = parseKey(String(pressKeys[i]));
         Keyboard.release(key);
         activeState[i] = false;
       }
@@ -422,7 +398,7 @@ void setup()
   Keyboard.begin();
   Keyboard.releaseAll();
   Serial.begin(9600);
-  loadFromEEPROM();
+  loadFromEEPROM(); // This will initialise EEPROM if needed
 }
 
 // ----- Loop -----
@@ -435,7 +411,6 @@ void loop()
     digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
   }
 
-  // Read switches with debounce and detect falling edge
   for (int i = 0; i < NUM_KEYS; i++)
   {
     int reading = digitalRead(pins[i]);
@@ -450,11 +425,33 @@ void loop()
         currentState[i] = reading;
         if (currentState[i] == LOW)
         {
-          pressTime[i] = millis(); // for SOCD
-          // If this button has a multi‑character sentence, send it on falling edge
-          if (!isSingleChar(i))
+          pressTime[i] = millis();
+        }
+
+        // Dual mode handling
+        if (mode[i] == 1)
+        {
+          if (currentState[i] == LOW)
           {
-            sendSentence(i);
+            int pressKey = parseKey(String(pressKeys[i]));
+            Keyboard.press(pressKey);
+            activeState[i] = true;
+          }
+          else
+          {
+            if (activeState[i])
+            {
+              int pressKey = parseKey(String(pressKeys[i]));
+              Keyboard.release(pressKey);
+              activeState[i] = false;
+            }
+            if (isValidReleaseKey(i))
+            {
+              int relKey = parseKey(String(releaseKeys[i]));
+              Keyboard.press(relKey);
+              delay(10);
+              Keyboard.release(relKey);
+            }
           }
         }
       }
@@ -462,10 +459,9 @@ void loop()
     lastState[i] = reading;
   }
 
-  // Update all keys (for single‑char buttons, including SOCD)
   updateKeys();
 
-  // ----- Serial commands (extended) -----
+  // ----- Serial commands -----
   if (Serial.available())
   {
     String cmd = Serial.readStringUntil('\n');
@@ -490,31 +486,54 @@ void loop()
     {
       Serial.println("PONG");
     }
-    else if (cmd.startsWith("GETSENT "))
+    else if (cmd.startsWith("GETPRESS"))
     {
-      int idx = cmd.substring(7).toInt() - 1;
-      if (idx >= 0 && idx < NUM_KEYS)
+      if (cmd == "GETPRESSALL")
       {
-        Serial.print("SENT" + String(idx + 1) + ":");
-        Serial.print(sentences[idx]);
-        Serial.print("|");
-        Serial.println(enterAfter[idx] ? "1" : "0");
+        for (int i = 0; i < NUM_KEYS; i++)
+        {
+          Serial.println("PRESS" + String(i + 1) + ":" + String(pressKeys[i]));
+        }
+        Serial.println("END");
+      }
+      else
+      {
+        int idx = cmd.substring(8).toInt() - 1;
+        if (idx >= 0 && idx < NUM_KEYS)
+        {
+          Serial.println("PRESS" + String(idx + 1) + ":" + String(pressKeys[idx]));
+        }
       }
     }
-    else if (cmd == "GETSENTALL")
+    else if (cmd.startsWith("GETRELEASE"))
+    {
+      if (cmd == "GETRELEASEALL")
+      {
+        for (int i = 0; i < NUM_KEYS; i++)
+        {
+          Serial.println("RELEASE" + String(i + 1) + ":" + String(releaseKeys[i]));
+        }
+        Serial.println("END");
+      }
+      else
+      {
+        int idx = cmd.substring(10).toInt() - 1;
+        if (idx >= 0 && idx < NUM_KEYS)
+        {
+          Serial.println("RELEASE" + String(idx + 1) + ":" + String(releaseKeys[idx]));
+        }
+      }
+    }
+    else if (cmd == "GETMODEALL")
     {
       for (int i = 0; i < NUM_KEYS; i++)
       {
-        Serial.print("SENT" + String(i + 1) + ":");
-        Serial.print(sentences[i]);
-        Serial.print("|");
-        Serial.println(enterAfter[i] ? "1" : "0");
+        Serial.println("MODE" + String(i + 1) + ":" + String(mode[i]));
       }
       Serial.println("END");
     }
-    else if (cmd.startsWith("SETSENT "))
+    else if (cmd.startsWith("SETPRESS "))
     {
-      // Format: SETSENT <idx>:<sentence>
       int space = cmd.indexOf(' ');
       if (space > 0)
       {
@@ -522,30 +541,18 @@ void loop()
         int colon = cmd.indexOf(':', space + 1);
         if (colon > 0 && idx >= 0 && idx < NUM_KEYS)
         {
-          String sent = cmd.substring(colon + 1);
-          sent.trim();
-          if (sent.length() <= MAX_SENTENCE_LEN)
+          String val = cmd.substring(colon + 1);
+          val.trim();
+          if (val.length() > 0 && val.length() < 16)
           {
-            // If new sentence is multi‑char, remove this button from any SOCD pair
-            if (sent.length() > 1)
-            {
-              removeButtonFromSOCD(idx);
-            }
-            strncpy(sentences[idx], sent.c_str(), MAX_SENTENCE_LEN);
-            sentences[idx][MAX_SENTENCE_LEN] = '\0';
+            strcpy(pressKeys[idx], val.c_str());
+            pressKeys[idx][15] = '\0';
             saveToEEPROM();
-            // Clear active state for this button if it was held
-            if (activeState[idx])
-            {
-              int key = parseKey(String(sentences[idx]));
-              Keyboard.release(key);
-              activeState[idx] = false;
-            }
             Serial.println("OK");
           }
           else
           {
-            Serial.println("ERROR: sentence too long (max 47 chars)");
+            Serial.println("ERROR: invalid key name");
           }
         }
         else
@@ -555,10 +562,43 @@ void loop()
       }
       else
       {
-        Serial.println("ERROR: syntax: SETSENT <idx>:<sentence>");
+        Serial.println("ERROR: syntax: SETPRESS <idx>:<key>");
       }
     }
-    else if (cmd.startsWith("SETENTER "))
+    else if (cmd.startsWith("SETRELEASE "))
+    {
+      int space = cmd.indexOf(' ');
+      if (space > 0)
+      {
+        int idx = cmd.substring(space + 1).toInt() - 1;
+        int colon = cmd.indexOf(':', space + 1);
+        if (colon > 0 && idx >= 0 && idx < NUM_KEYS)
+        {
+          String val = cmd.substring(colon + 1);
+          val.trim();
+          if (val.length() > 0 && val.length() < 16)
+          {
+            strcpy(releaseKeys[idx], val.c_str());
+            releaseKeys[idx][15] = '\0';
+            saveToEEPROM();
+            Serial.println("OK");
+          }
+          else
+          {
+            Serial.println("ERROR: invalid key name");
+          }
+        }
+        else
+        {
+          Serial.println("ERROR: invalid index");
+        }
+      }
+      else
+      {
+        Serial.println("ERROR: syntax: SETRELEASE <idx>:<key>");
+      }
+    }
+    else if (cmd.startsWith("SETMODE "))
     {
       int space = cmd.indexOf(' ');
       if (space > 0)
@@ -570,13 +610,23 @@ void loop()
           int val = cmd.substring(colon + 1).toInt();
           if (val == 0 || val == 1)
           {
-            enterAfter[idx] = (val == 1);
+            if (val == 1)
+            {
+              removeButtonFromSOCD(idx);
+            }
+            mode[idx] = val;
+            if (activeState[idx])
+            {
+              int key = parseKey(String(pressKeys[idx]));
+              Keyboard.release(key);
+              activeState[idx] = false;
+            }
             saveToEEPROM();
             Serial.println("OK");
           }
           else
           {
-            Serial.println("ERROR: value must be 0 or 1");
+            Serial.println("ERROR: mode must be 0 or 1");
           }
         }
         else
@@ -586,20 +636,10 @@ void loop()
       }
       else
       {
-        Serial.println("ERROR: syntax: SETENTER <idx>:<0|1>");
+        Serial.println("ERROR: syntax: SETMODE <idx>:<0|1>");
       }
     }
-    // Legacy GETKEY (for compatibility, returns first char of sentence)
-    else if (cmd.startsWith("GETKEY"))
-    {
-      int idx = cmd.substring(6).toInt() - 1;
-      if (idx >= 0 && idx < NUM_KEYS)
-      {
-        String firstChar = String(sentences[idx][0]);
-        Serial.println("KEY" + String(idx + 1) + ":" + firstChar);
-      }
-    }
-    // Legacy SETKEY (sets sentence to single character, disables Enter)
+    // Legacy SETKEY (sets press key and mode to 0)
     else if (cmd.startsWith("SETKEY"))
     {
       int colon = cmd.indexOf(':');
@@ -608,18 +648,19 @@ void loop()
         int idx = cmd.substring(6, colon).toInt() - 1;
         String val = cmd.substring(colon + 1);
         val.trim();
-        if (idx >= 0 && idx < NUM_KEYS && val.length() > 0 && val.length() <= MAX_SENTENCE_LEN)
+        if (idx >= 0 && idx < NUM_KEYS && val.length() > 0 && val.length() < 16)
         {
-          strncpy(sentences[idx], val.c_str(), MAX_SENTENCE_LEN);
-          sentences[idx][MAX_SENTENCE_LEN] = '\0';
-          enterAfter[idx] = false; // disable Enter when using legacy SETKEY
-          // If multi‑char, remove from SOCD
-          if (val.length() > 1)
+          strcpy(pressKeys[idx], val.c_str());
+          pressKeys[idx][15] = '\0';
+          if (mode[idx] == 1)
+          {
             removeButtonFromSOCD(idx);
+          }
+          mode[idx] = 0;
           saveToEEPROM();
           if (activeState[idx])
           {
-            int key = parseKey(String(sentences[idx]));
+            int key = parseKey(String(pressKeys[idx]));
             Keyboard.release(key);
             activeState[idx] = false;
           }
@@ -627,17 +668,16 @@ void loop()
         }
       }
     }
-    // Legacy GETALL – returns first character of each sentence (for display in old UI)
+    // Legacy GETALL – returns press keys only
     else if (cmd == "GETALL")
     {
       for (int i = 0; i < NUM_KEYS; i++)
       {
-        String firstChar = String(sentences[i][0]);
-        Serial.println("KEY" + String(i + 1) + ":" + firstChar);
+        Serial.println("KEY" + String(i + 1) + ":" + String(pressKeys[i]));
       }
       Serial.println("END");
     }
-    // ---------- SOCD commands (unchanged) ----------
+    // SOCD commands
     else if (cmd.startsWith("SOCD ADD "))
     {
       String rest = cmd.substring(9);
@@ -649,10 +689,13 @@ void loop()
         int idx2 = rest.substring(space + 1).toInt() - 1;
         if (idx1 >= 0 && idx1 < NUM_KEYS && idx2 >= 0 && idx2 < NUM_KEYS && idx1 != idx2)
         {
-          // Check both are single‑char
-          if (!isSingleChar(idx1) || !isSingleChar(idx2))
+          if (mode[idx1] != 0 || mode[idx2] != 0)
           {
-            Serial.println("ERROR: both buttons must have single‑character sentences");
+            Serial.println("ERROR: both buttons must be in Key mode for SOCD");
+          }
+          else if (!isValidPressKey(idx1) || !isValidPressKey(idx2))
+          {
+            Serial.println("ERROR: both buttons must have valid press keys");
           }
           else
           {
@@ -676,14 +719,13 @@ void loop()
               socdPairs[socdCount][1] = idx2;
               socdCount++;
               saveToEEPROM();
-              // Release active states for these two
               int relIdx[2] = {idx1, idx2};
               for (int r = 0; r < 2; r++)
               {
                 int i = relIdx[r];
                 if (activeState[i])
                 {
-                  Keyboard.release(parseKey(String(sentences[i])));
+                  Keyboard.release(parseKey(String(pressKeys[i])));
                   activeState[i] = false;
                 }
               }
@@ -724,7 +766,7 @@ void loop()
         {
           if (activeState[i])
           {
-            Keyboard.release(parseKey(String(sentences[i])));
+            Keyboard.release(parseKey(String(pressKeys[i])));
             activeState[i] = false;
           }
         }
@@ -749,7 +791,7 @@ void loop()
       {
         if (activeState[i])
         {
-          Keyboard.release(parseKey(String(sentences[i])));
+          Keyboard.release(parseKey(String(pressKeys[i])));
           activeState[i] = false;
         }
       }
@@ -774,7 +816,7 @@ void loop()
         Serial.println(response);
       }
     }
-    // Legacy SOCD SET / OFF (treat as single pair)
+    // Legacy SOCD SET/OFF
     else if (cmd == "SOCD OFF")
     {
       socdCount = 0;
@@ -788,7 +830,7 @@ void loop()
       {
         if (activeState[i])
         {
-          Keyboard.release(parseKey(String(sentences[i])));
+          Keyboard.release(parseKey(String(pressKeys[i])));
           activeState[i] = false;
         }
       }
@@ -805,9 +847,9 @@ void loop()
         int idx1 = rest.substring(0, space).toInt() - 1;
         int idx2 = rest.substring(space + 1).toInt() - 1;
         if (idx1 >= 0 && idx1 < NUM_KEYS && idx2 >= 0 && idx2 < NUM_KEYS && idx1 != idx2 &&
-            isSingleChar(idx1) && isSingleChar(idx2))
+            mode[idx1] == 0 && mode[idx2] == 0 &&
+            isValidPressKey(idx1) && isValidPressKey(idx2))
         {
-          // Replace all with this single pair
           socdCount = 1;
           socdPairs[0][0] = idx1;
           socdPairs[0][1] = idx2;
@@ -817,23 +859,21 @@ void loop()
             socdPairs[p][1] = -1;
           }
           saveToEEPROM();
-          // Release active states for these two
           int relIdx[2] = {idx1, idx2};
           for (int r = 0; r < 2; r++)
           {
             int i = relIdx[r];
             if (activeState[i])
             {
-              Keyboard.release(parseKey(String(sentences[i])));
+              Keyboard.release(parseKey(String(pressKeys[i])));
               activeState[i] = false;
             }
           }
-          // Also release all other active keys
           for (int i = 0; i < NUM_KEYS; i++)
           {
             if (i != idx1 && i != idx2 && activeState[i])
             {
-              Keyboard.release(parseKey(String(sentences[i])));
+              Keyboard.release(parseKey(String(pressKeys[i])));
               activeState[i] = false;
             }
           }
@@ -842,7 +882,7 @@ void loop()
         }
         else
         {
-          Serial.println("ERROR: invalid indices or not single‑char");
+          Serial.println("ERROR: invalid indices or not Key mode / invalid press keys");
         }
       }
       else
