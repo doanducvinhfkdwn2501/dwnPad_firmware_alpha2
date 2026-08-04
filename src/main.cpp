@@ -11,18 +11,24 @@
 const int pins[] = {7, 4, 6, 2, 5, 3};
 const int NUM_KEYS = 6;
 
-// EEPROM layout
+// ---------- EEPROM layout ----------
 const int MAGIC_ADDR = 0;
 const int PRESS_NAMES_ADDR = 1;                                  // 6 * 16 = 96
 const int RELEASE_NAMES_ADDR = PRESS_NAMES_ADDR + NUM_KEYS * 16; // 96
-const int MODE_ADDR = RELEASE_NAMES_ADDR + NUM_KEYS * 16;        // 6 bytes
-const int SOCD_COUNT_ADDR = MODE_ADDR + NUM_KEYS;                // 1 byte
-const int SOCD_DATA_ADDR = SOCD_COUNT_ADDR + 1;                  // 2 * MAX_PAIRS
-const byte MAGIC_VALUE = 0xDD;                                   // NEW magic – forces reset if old EEPROM data exists
+const int MODE_ADDR = RELEASE_NAMES_ADDR + NUM_KEYS * 16;        // 6
+const int SOCD_COUNT_ADDR = MODE_ADDR + NUM_KEYS;                // 1
+const int SOCD_DATA_ADDR = SOCD_COUNT_ADDR + 1;                  // 2 * MAX_PAIRS = 4
+const int MACRO_DATA_ADDR = SOCD_DATA_ADDR + 4;                  // new: macro storage
+
+// Macro settings
+const int MAX_MACRO_STEPS = 8;
+const int MACRO_STEP_SIZE = 4;                                        // action(1) + key(1) + delay(2)
+const int MACRO_BYTES_PER_BUTTON = MAX_MACRO_STEPS * MACRO_STEP_SIZE; // 32
 
 const int MAX_SOCD_PAIRS = 2;
+const byte MAGIC_VALUE = 0xDE; // new magic
 
-// Defaults: all keys, no release keys, all Key mode
+// Defaults
 const char defaultPressKeys[NUM_KEYS][16] = {"q", "w", "e", "a", "s", "d"};
 const char defaultReleaseKeys[NUM_KEYS][16] = {"", "", "", "", "", ""};
 const uint8_t defaultMode[NUM_KEYS] = {0, 0, 0, 0, 0, 0};
@@ -30,11 +36,25 @@ const uint8_t defaultMode[NUM_KEYS] = {0, 0, 0, 0, 0, 0};
 // Runtime data
 char pressKeys[NUM_KEYS][16];
 char releaseKeys[NUM_KEYS][16];
-uint8_t mode[NUM_KEYS]; // 0=Key, 1=Dual
+uint8_t mode[NUM_KEYS]; // 0=Key, 1=Dual, 2=Macro
 
 // SOCD
 int socdPairs[MAX_SOCD_PAIRS][2];
 int socdCount = 0;
+
+// Macro
+struct MacroStep
+{
+  uint8_t action; // 0=Press, 1=Release, 2=Both, 3=Delay
+  uint8_t key;    // HID key code (0 for Delay)
+  uint16_t delay; // milliseconds (for Delay action)
+};
+struct MacroData
+{
+  uint8_t count;
+  MacroStep steps[MAX_MACRO_STEPS];
+};
+MacroData macroData[NUM_KEYS];
 
 // Debounce & state
 unsigned long lastDebounceTime[NUM_KEYS] = {0};
@@ -148,9 +168,83 @@ void removeButtonFromSOCD(int idx)
   }
 }
 
-// ----- EEPROM -----
+// ----- Macro pack/unpack to/from EEPROM -----
+void packMacro(int idx, byte *buffer)
+{
+  MacroData *md = &macroData[idx];
+  buffer[0] = md->count;
+  int pos = 1;
+  for (int i = 0; i < md->count; i++)
+  {
+    buffer[pos++] = md->steps[i].action;
+    buffer[pos++] = md->steps[i].key;
+    buffer[pos++] = md->steps[i].delay & 0xFF;
+    buffer[pos++] = (md->steps[i].delay >> 8) & 0xFF;
+  }
+  // Zero out remaining bytes
+  for (int i = pos; i < MACRO_BYTES_PER_BUTTON; i++)
+    buffer[i] = 0;
+}
+
+void unpackMacro(int idx, byte *buffer)
+{
+  MacroData *md = &macroData[idx];
+  md->count = buffer[0];
+  if (md->count > MAX_MACRO_STEPS)
+    md->count = MAX_MACRO_STEPS;
+  int pos = 1;
+  for (int i = 0; i < md->count; i++)
+  {
+    md->steps[i].action = buffer[pos++];
+    md->steps[i].key = buffer[pos++];
+    uint8_t low = buffer[pos++];
+    uint8_t high = buffer[pos++];
+    md->steps[i].delay = low | (high << 8);
+    if (md->steps[i].delay > 5000)
+      md->steps[i].delay = 5000;
+  }
+}
+
+void clearMacro(int idx)
+{
+  macroData[idx].count = 0;
+}
+
+void playMacro(int idx)
+{
+  MacroData *md = &macroData[idx];
+  if (md->count == 0)
+    return;
+  for (int i = 0; i < md->count; i++)
+  {
+    MacroStep *step = &md->steps[i];
+    if (step->action == 0)
+    { // Press
+      Keyboard.press(step->key);
+    }
+    else if (step->action == 1)
+    { // Release
+      Keyboard.release(step->key);
+    }
+    else if (step->action == 2)
+    { // Both
+      Keyboard.press(step->key);
+      delay(10);
+      Keyboard.release(step->key);
+    }
+    else if (step->action == 3)
+    { // Delay
+      delay(step->delay);
+    }
+    delay(5);
+  }
+  Keyboard.releaseAll();
+}
+
+// ----- EEPROM (optimised: only write macro data if button is in Macro mode) -----
 void saveToEEPROM()
 {
+  // Press keys
   for (int i = 0; i < NUM_KEYS; i++)
   {
     int addr = PRESS_NAMES_ADDR + i * 16;
@@ -160,21 +254,45 @@ void saveToEEPROM()
       if (pressKeys[i][j] == '\0')
         break;
     }
-    addr = RELEASE_NAMES_ADDR + i * 16;
+  }
+  // Release keys
+  for (int i = 0; i < NUM_KEYS; i++)
+  {
+    int addr = RELEASE_NAMES_ADDR + i * 16;
     for (int j = 0; j < 16; j++)
     {
       EEPROM.write(addr + j, releaseKeys[i][j]);
       if (releaseKeys[i][j] == '\0')
         break;
     }
+  }
+  // Modes
+  for (int i = 0; i < NUM_KEYS; i++)
+  {
     EEPROM.write(MODE_ADDR + i, mode[i]);
   }
+  // SOCD
   EEPROM.write(SOCD_COUNT_ADDR, socdCount);
   int addr = SOCD_DATA_ADDR;
   for (int p = 0; p < MAX_SOCD_PAIRS; p++)
   {
     EEPROM.write(addr + p * 2, socdPairs[p][0] + 1);
     EEPROM.write(addr + p * 2 + 1, socdPairs[p][1] + 1);
+  }
+  // Macros – ONLY write if the button is in Macro mode
+  byte buffer[MACRO_BYTES_PER_BUTTON];
+  for (int i = 0; i < NUM_KEYS; i++)
+  {
+    if (mode[i] == 2)
+    {
+      packMacro(i, buffer);
+      addr = MACRO_DATA_ADDR + i * MACRO_BYTES_PER_BUTTON;
+      for (int j = 0; j < MACRO_BYTES_PER_BUTTON; j++)
+      {
+        EEPROM.write(addr + j, buffer[j]);
+      }
+    }
+    // If not Macro mode, we skip writing – the old data remains but is ignored.
   }
   EEPROM.write(MAGIC_ADDR, MAGIC_VALUE);
 }
@@ -187,6 +305,7 @@ void loadFromEEPROM()
     strcpy(pressKeys[i], defaultPressKeys[i]);
     strcpy(releaseKeys[i], defaultReleaseKeys[i]);
     mode[i] = defaultMode[i];
+    clearMacro(i);
   }
   socdCount = 0;
   for (int p = 0; p < MAX_SOCD_PAIRS; p++)
@@ -197,8 +316,10 @@ void loadFromEEPROM()
   saveToEEPROM();
   return;
 #endif
+
   if (EEPROM.read(MAGIC_ADDR) == MAGIC_VALUE)
   {
+    // Press keys
     for (int i = 0; i < NUM_KEYS; i++)
     {
       int addr = PRESS_NAMES_ADDR + i * 16;
@@ -218,9 +339,10 @@ void loadFromEEPROM()
       }
       releaseKeys[i][15] = '\0';
       mode[i] = EEPROM.read(MODE_ADDR + i);
-      if (mode[i] > 1)
+      if (mode[i] > 2)
         mode[i] = 0;
     }
+    // SOCD
     socdCount = EEPROM.read(SOCD_COUNT_ADDR);
     if (socdCount > MAX_SOCD_PAIRS)
       socdCount = MAX_SOCD_PAIRS;
@@ -258,6 +380,24 @@ void loadFromEEPROM()
         p--;
       }
     }
+    // Macros – load only if mode == 2
+    byte buffer[MACRO_BYTES_PER_BUTTON];
+    for (int i = 0; i < NUM_KEYS; i++)
+    {
+      if (mode[i] == 2)
+      {
+        addr = MACRO_DATA_ADDR + i * MACRO_BYTES_PER_BUTTON;
+        for (int j = 0; j < MACRO_BYTES_PER_BUTTON; j++)
+        {
+          buffer[j] = EEPROM.read(addr + j);
+        }
+        unpackMacro(i, buffer);
+      }
+      else
+      {
+        clearMacro(i);
+      }
+    }
   }
   else
   {
@@ -267,6 +407,7 @@ void loadFromEEPROM()
       strcpy(pressKeys[i], defaultPressKeys[i]);
       strcpy(releaseKeys[i], defaultReleaseKeys[i]);
       mode[i] = defaultMode[i];
+      clearMacro(i);
     }
     socdCount = 0;
     for (int p = 0; p < MAX_SOCD_PAIRS; p++)
@@ -285,6 +426,7 @@ void resetToDefaults()
     strcpy(pressKeys[i], defaultPressKeys[i]);
     strcpy(releaseKeys[i], defaultReleaseKeys[i]);
     mode[i] = defaultMode[i];
+    clearMacro(i);
   }
   socdCount = 0;
   for (int p = 0; p < MAX_SOCD_PAIRS; p++)
@@ -398,7 +540,7 @@ void setup()
   Keyboard.begin();
   Keyboard.releaseAll();
   Serial.begin(9600);
-  loadFromEEPROM(); // This will initialise EEPROM if needed
+  loadFromEEPROM();
 }
 
 // ----- Loop -----
@@ -426,6 +568,11 @@ void loop()
         if (currentState[i] == LOW)
         {
           pressTime[i] = millis();
+          // Macro mode: play on press
+          if (mode[i] == 2)
+          {
+            playMacro(i);
+          }
         }
 
         // Dual mode handling
@@ -486,6 +633,7 @@ void loop()
     {
       Serial.println("PONG");
     }
+    // ----- Old website commands (unchanged) -----
     else if (cmd.startsWith("GETPRESS"))
     {
       if (cmd == "GETPRESSALL")
@@ -608,9 +756,9 @@ void loop()
         if (colon > 0 && idx >= 0 && idx < NUM_KEYS)
         {
           int val = cmd.substring(colon + 1).toInt();
-          if (val == 0 || val == 1)
+          if (val == 0 || val == 1 || val == 2)
           {
-            if (val == 1)
+            if (val == 1 || val == 2)
             {
               removeButtonFromSOCD(idx);
             }
@@ -626,7 +774,7 @@ void loop()
           }
           else
           {
-            Serial.println("ERROR: mode must be 0 or 1");
+            Serial.println("ERROR: mode must be 0, 1, or 2");
           }
         }
         else
@@ -636,7 +784,7 @@ void loop()
       }
       else
       {
-        Serial.println("ERROR: syntax: SETMODE <idx>:<0|1>");
+        Serial.println("ERROR: syntax: SETMODE <idx>:<0|1|2>");
       }
     }
     // Legacy SETKEY (sets press key and mode to 0)
@@ -652,11 +800,12 @@ void loop()
         {
           strcpy(pressKeys[idx], val.c_str());
           pressKeys[idx][15] = '\0';
-          if (mode[idx] == 1)
+          if (mode[idx] == 1 || mode[idx] == 2)
           {
             removeButtonFromSOCD(idx);
           }
           mode[idx] = 0;
+          clearMacro(idx);
           saveToEEPROM();
           if (activeState[idx])
           {
@@ -677,7 +826,159 @@ void loop()
       }
       Serial.println("END");
     }
-    // SOCD commands
+    // ----- New Macro commands (for future UI) -----
+    else if (cmd.startsWith("SETMACRO "))
+    {
+      int space = cmd.indexOf(' ');
+      if (space > 0)
+      {
+        int idx = cmd.substring(space + 1).toInt() - 1;
+        int colon = cmd.indexOf(':', space + 1);
+        if (colon > 0 && idx >= 0 && idx < NUM_KEYS)
+        {
+          String macroStr = cmd.substring(colon + 1);
+          macroStr.trim();
+          int stepCount = 0;
+          MacroData *md = &macroData[idx];
+          md->count = 0;
+          size_t startPos = 0;
+          while (startPos < macroStr.length() && stepCount < MAX_MACRO_STEPS)
+          {
+            int commaPos = macroStr.indexOf(',', startPos);
+            String token = (commaPos == -1) ? macroStr.substring(startPos) : macroStr.substring(startPos, commaPos);
+            token.trim();
+            if (token.length() > 0)
+            {
+              char actionChar = token.charAt(0);
+              int colonPos = token.indexOf(':');
+              if (colonPos > 0)
+              {
+                String value = token.substring(colonPos + 1);
+                value.trim();
+                if (actionChar == 'P' || actionChar == 'p')
+                {
+                  md->steps[stepCount].action = 0;
+                  md->steps[stepCount].key = parseKey(value);
+                  md->steps[stepCount].delay = 0;
+                  stepCount++;
+                }
+                else if (actionChar == 'R' || actionChar == 'r')
+                {
+                  md->steps[stepCount].action = 1;
+                  md->steps[stepCount].key = parseKey(value);
+                  md->steps[stepCount].delay = 0;
+                  stepCount++;
+                }
+                else if (actionChar == 'B' || actionChar == 'b')
+                {
+                  md->steps[stepCount].action = 2;
+                  md->steps[stepCount].key = parseKey(value);
+                  md->steps[stepCount].delay = 0;
+                  stepCount++;
+                }
+                else if (actionChar == 'D' || actionChar == 'd')
+                {
+                  md->steps[stepCount].action = 3;
+                  md->steps[stepCount].key = 0;
+                  md->steps[stepCount].delay = value.toInt();
+                  if (md->steps[stepCount].delay > 5000)
+                    md->steps[stepCount].delay = 5000;
+                  stepCount++;
+                }
+                else
+                {
+                  // ignore
+                }
+              }
+            }
+            if (commaPos == -1)
+              break;
+            startPos = commaPos + 1;
+          }
+          md->count = stepCount;
+          if (mode[idx] != 2)
+          {
+            mode[idx] = 2;
+            removeButtonFromSOCD(idx);
+          }
+          saveToEEPROM();
+          Serial.println("OK");
+        }
+        else
+        {
+          Serial.println("ERROR: invalid index");
+        }
+      }
+      else
+      {
+        Serial.println("ERROR: syntax: SETMACRO <idx>:<steps>");
+      }
+    }
+    else if (cmd.startsWith("GETMACRO "))
+    {
+      int idx = cmd.substring(9).toInt() - 1;
+      if (idx >= 0 && idx < NUM_KEYS)
+      {
+        MacroData *md = &macroData[idx];
+        String result = "";
+        for (int i = 0; i < md->count; i++)
+        {
+          if (i > 0)
+            result += ",";
+          MacroStep *step = &md->steps[i];
+          if (step->action == 0)
+            result += "P:";
+          else if (step->action == 1)
+            result += "R:";
+          else if (step->action == 2)
+            result += "B:";
+          else if (step->action == 3)
+            result += "D:";
+          if (step->action == 3)
+          {
+            result += String(step->delay);
+          }
+          else
+          {
+            result += String(step->key);
+          }
+        }
+        Serial.println("MACRO" + String(idx + 1) + ":" + result);
+      }
+    }
+    else if (cmd == "GETMACROALL")
+    {
+      for (int i = 0; i < NUM_KEYS; i++)
+      {
+        MacroData *md = &macroData[i];
+        String result = "";
+        for (int j = 0; j < md->count; j++)
+        {
+          if (j > 0)
+            result += ",";
+          MacroStep *step = &md->steps[j];
+          if (step->action == 0)
+            result += "P:";
+          else if (step->action == 1)
+            result += "R:";
+          else if (step->action == 2)
+            result += "B:";
+          else if (step->action == 3)
+            result += "D:";
+          if (step->action == 3)
+          {
+            result += String(step->delay);
+          }
+          else
+          {
+            result += String(step->key);
+          }
+        }
+        Serial.println("MACRO" + String(i + 1) + ":" + result);
+      }
+      Serial.println("END");
+    }
+    // ----- SOCD commands (unchanged) -----
     else if (cmd.startsWith("SOCD ADD "))
     {
       String rest = cmd.substring(9);
