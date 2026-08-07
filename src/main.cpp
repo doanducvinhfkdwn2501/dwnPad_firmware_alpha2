@@ -565,6 +565,10 @@ void loop()
       if (reading != currentState[i])
       {
         currentState[i] = reading;
+        Serial.print("STATE:");
+        Serial.print(i + 1);
+        Serial.print(":");
+        Serial.println(currentState[i] == LOW ? "1" : "0");
         if (currentState[i] == LOW)
         {
           pressTime[i] = millis();
