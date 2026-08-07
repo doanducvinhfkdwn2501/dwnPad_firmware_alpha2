@@ -21,7 +21,7 @@ const int SOCD_DATA_ADDR = SOCD_COUNT_ADDR + 1;                  // 2 * MAX_PAIR
 const int MACRO_DATA_ADDR = SOCD_DATA_ADDR + 4;                  // new: macro storage
 
 // Macro settings
-const int MAX_MACRO_STEPS = 8;
+const int MAX_MACRO_STEPS = 7;
 const int MACRO_STEP_SIZE = 4;                                        // action(1) + key(1) + delay(2)
 const int MACRO_BYTES_PER_BUTTON = MAX_MACRO_STEPS * MACRO_STEP_SIZE; // 32
 
